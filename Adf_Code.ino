@@ -22,7 +22,7 @@
 #define REGISTER_2 0x18005E42U
 
 // Register 1 contains the MOD for the calcultion below
-#define REGISTER_1 0x00008011U
+#define REGISTER_1 0x00005011U
 
 // Register 0 is the INT value
 // INT value = (desired output frequency)/(crystal ocsillator frequecny)
@@ -90,3 +90,4 @@ void setup() {
 
 void loop() {
 }
+
