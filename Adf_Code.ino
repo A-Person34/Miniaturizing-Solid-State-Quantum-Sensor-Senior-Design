@@ -12,24 +12,24 @@
 #define REGISTER_5 0x00580005U
 
 // Register 4 is output divider
-#define REGISTER_4 0x00AC803CU
+#define REGISTER_4 0x008C803CU
 
 // Register 3 has a weird clock divider
-#define REGISTER_3 0x00E00003U
+#define REGISTER_3 0x00A00003U
 
 // Register 2 is the R bit counter
 // Divides down input frequency (cystal oscillator)
-#define REGISTER_2 0x0C006F82U
+#define REGISTER_2 0x0C006E82U
 
 // Register 1 contains the MOD for the calcultion below
-#define REGISTER_1 0x00008011U
+#define REGISTER_1 0x00008051U
 
 // Register 0 is the INT value
 // INT value = (desired output frequency)/(crystal ocsillator frequecny)
 // INT value also depends on FRAC and MOD but for now we are not worrying about it
 // RFout = [INT + (FRAC/MOD)] (fpfd/RF Divider)
 // Rgister 0 also contains FRAC to change through for other frequencies
-#define REGISTER_0 0x00300000U
+#define REGISTER_0 0x00390040U
 
 // end customizing here
 
