@@ -9,9 +9,9 @@
 
 // ================= USER SETTINGS =================
 double centerFreq = 2870.0;
-double span       = 300.0;
+double span       = 100.0;
 double stepSize   = 0.5;
-int sweepDelay    = 500;
+int sweepDelay    = 10;
 
 // ================= PLL CONSTANTS =================
 double fPFD = 25.0;
@@ -108,7 +108,10 @@ void setup() {
   for (double f = startFreq; f <= endFreq; f += stepSize) {
 
     setFrequency(f);
-
+    delay(sweepDelay);
+    double avgvolt = 0;
+    for (int i = 0; i<10; i++ )
+    { 
     int sum = 0;
     for (int i = 0; i < 32; i++) {
       sum += analogRead(ADC_PIN);
@@ -116,12 +119,15 @@ void setup() {
 
     int adcValue = sum / 32;
     double voltage = (adcValue / 4095.0) * 3.3;
-
+    avgvolt+=voltage;
+    
+    }
+    avgvolt = avgvolt/10;
     Serial.print(f);
     Serial.print(",");
-    Serial.println(voltage, 6);
+    Serial.println(avgvolt, 6);
 
-    delay(sweepDelay);
+    
   }
 
   // Return to center frequency
