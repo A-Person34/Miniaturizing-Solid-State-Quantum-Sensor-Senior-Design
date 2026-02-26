@@ -31,14 +31,16 @@
 // Rgister 0 also contains FRAC to change through for other frequencies
 #define REGISTER_0 0x00390040U
 
+/*
 //chat code registers for power
-//#define REGISTER_5 0x00580005U
-// #define REGISTER_4 0x008C803CU
-// #define REGISTER_3 0x008004B3U
-// #define REGISTER_2 0x18006E42U
-// #define REGISTER_1 0x00001F41U
-// #define REGISTER_0 0x00391900U
-// end customizing here
+#define REGISTER_5 0x00580005U
+#define REGISTER_4 0x008C803CU
+#define REGISTER_3 0x008004B3U
+#define REGISTER_2 0x18006E42U
+#define REGISTER_1 0x00001F41U
+#define REGISTER_0 0x00391900U
+end customizing here 
+*/
 
 #define DELAY 1
 
@@ -97,4 +99,5 @@ void setup() {
 
 void loop() {
 }
+
 
