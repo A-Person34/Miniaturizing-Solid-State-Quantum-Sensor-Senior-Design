@@ -39,7 +39,7 @@
 #define REGISTER_2 0x18006E42U
 #define REGISTER_1 0x00001F41U
 #define REGISTER_0 0x00391900U
-end customizing here 
+// end customizing here 
 */
 
 #define DELAY 1
@@ -99,5 +99,6 @@ void setup() {
 
 void loop() {
 }
+
 
 
