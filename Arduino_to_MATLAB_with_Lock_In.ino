@@ -14,7 +14,7 @@ double stepSize   = 1;
 int sweepDelay    = 10;
 
 // ================= LOCK-IN SETTINGS =================
-double fmDevMHz      = 27.25;   // frequency hop
+double fmDevMHz      = 27.8;  // frequency hop
 int settleTimeMs     = 3;     // PLL settling time
 int lockinAverages   = 100;   // number of lock-in cycles
 int adcSamples       = 32;
