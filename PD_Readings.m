@@ -4,6 +4,7 @@ clc
 port = "COM4";   % <-- CHANGE THIS
 baud = 115200;
 
+
 s = serialport(port, baud);
 configureTerminator(s,"LF");
 s.Timeout = 20;
@@ -30,7 +31,7 @@ while true
     if s.NumBytesAvailable > 0
         
         line = readline(s);
-        lastDataTime = tic;   % reset timer when data arrives
+        lastDataTime = tic;
         
         if contains(line,"Frequency")
             continue
@@ -51,7 +52,6 @@ while true
         end
         
     else
-        % If no data for 2 seconds → sweep done
         if toc(lastDataTime) > 2
             break
         end
@@ -66,10 +66,28 @@ end
 
 disp("Sweep complete.")
 
-% Optional: Final clean plot redraw
+% ===== FINAL VOLTAGE FIGURE =====
 figure
 plot(data(:,1), data(:,2), 'LineWidth',2)
 xlabel("Frequency (MHz)")
 ylabel("Voltage (V)")
 title("Microwave Sweep (Final)")
 grid on
+
+% ===== FINAL INTEGRAL FIGURE =====
+if size(data,1) > 2
+    
+    freq = data(:,1);
+    volt = data(:,2);
+    
+    % Numerical integral using trapezoidal rule
+    integral_signal = cumtrapz(freq, volt);
+    
+    figure
+    plot(freq, integral_signal, 'LineWidth',2)
+    xlabel("Frequency (MHz)")
+    ylabel("Integral of Voltage")
+    title("Antiderivative / Integral of Signal")
+    grid on
+    
+end
