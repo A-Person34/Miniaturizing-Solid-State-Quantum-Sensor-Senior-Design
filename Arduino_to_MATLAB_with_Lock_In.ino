@@ -8,9 +8,9 @@
 #define ADC_PIN   0
 
 // ================= USER SETTINGS =================
-double centerFreq = 2870.0;
-double span       = 200.0;
-double stepSize   = 1;
+double centerFreq = 2870.0;   // Center frequency for where the middle should be in MHz
+double span       = 200.0;    // How far we will sweep in total (span/2 on each side of the center frequency)
+double stepSize   = 1;        // How far we step each time in MHz
 int sweepDelay    = 10;
 
 // ================= LOCK-IN SETTINGS =================
