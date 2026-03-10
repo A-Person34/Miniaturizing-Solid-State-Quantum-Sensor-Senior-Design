@@ -18,8 +18,15 @@ int sweepDelay    = 10;
 // f0 is the carrier frequency
 // A is the amplitude of the modulated signal
 // fm is the modulation frequency
+// settleTimeUs is the modulation freqeuncy. We find it using this for loop as an example
+/*
+    for(double fm = 100; fm <= 1000; fm += 10)
+    {
+        settleTimeUs = 500.0 / fm;
+    }
+*/
 double fmDevMHz      = 26.8;  // frequency hop (A in above equation)
-int settleTimeMs     = 3;     // PLL settling time
+int settleTimeUs     = 3000;  // PLL settling time
 int lockinAverages   = 100;   // number of lock-in cycles
 int adcSamples       = 32;
 
@@ -156,12 +163,12 @@ double measureLockin(double f)
   {
     // First, measure at high frequency
     setFrequencyFast(f + fmDevMHz);
-    delay(settleTimeMs);
+    delayMicroseconds(settleTimeUs);
     double high = readAveragedVoltage(adcSamples);
 
     // Next, measure at low frequency 
     setFrequencyFast(f - fmDevMHz);
-    delay(settleTimeMs);
+    delayMicroseconds(settleTimeUs);
     double low = readAveragedVoltage(adcSamples);
 
     // Next, take the difference between them and take a bunch of samples to average 
