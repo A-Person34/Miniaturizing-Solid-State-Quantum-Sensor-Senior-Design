@@ -1,0 +1,407 @@
+clear
+clc
+close all
+%% ================= USER SETTINGS =================
+port = "COM6";
+baud = 115200;
+% Fixed experiment settings
+centerFreq = 2870.0;
+span       = 70.0;     % fixed, does NOT change during PSO
+% ---------- FAST CHECK VALUES ----------
+% Use these first to make sure full PSO works end-to-end.
+% numSweeps = 3;
+% lockinAvg = 10;
+% adcAvg    = 4;
+% ---------- REAL RUN VALUES ----------
+% When the fast check works, replace the 3 lines above with:
+numSweeps = 10;
+lockinAvg = 100;
+adcAvg    = 8;
+showLiveParticleRuns = false;   % false = faster
+showSummaryPlots     = true;
+%% ================= PSO SETTINGS =================
+nParticles  = 4;   % start here
+nIterations = 50;   % start here
+w  = 0.7;
+c1 = 1.4;
+c2 = 1.6;
+% Variable order: [A_MHz, fm_Hz, stepSize_MHz]
+lb = [1.0, 100, 0.5];
+ub = [30.0, 1000, 2.0];
+AGrid    = 1.0;   % A in 1 MHz steps
+fmGrid   = 10;    % fm in 10 Hz steps
+stepGrid = 0.1;   % step size in 0.1 MHz steps
+% Score weights
+wSNR    = 0.85;
+wSignal = 0.15;
+%% ================= SERIAL SETUP =================
+oldPorts = serialportfind("Port", port);
+if ~isempty(oldPorts)
+   delete(oldPorts);
+end
+s = serialport(port, baud);
+configureTerminator(s, "LF");
+s.Timeout = 120;
+pause(3);
+flush(s);
+disp("Sending PING...")
+writeline(s, "PING");
+pause(1);
+while s.NumBytesAvailable > 0
+   disp("BOARD -> " + strtrim(readline(s)));
+end
+%% ================= INITIALIZE SWARM =================
+nVar = 3;
+pos = zeros(nParticles, nVar);
+vel = zeros(nParticles, nVar);
+for p = 1:nParticles
+   pos(p,:) = lb + rand(1,nVar).*(ub - lb);
+end
+pos = snapAndClamp(pos, lb, ub, AGrid, fmGrid, stepGrid);
+vel = 0.1*(rand(nParticles,nVar)-0.5).*(ub-lb);
+pBestPos   = pos;
+pBestScore = -inf(nParticles,1);
+pBestData  = repmat(emptyResultStruct(), nParticles, 1);
+gBestPos   = nan(1,nVar);
+gBestScore = -inf;
+gBestData  = emptyResultStruct();
+history = [];
+%% ================= MAIN PSO LOOP =================
+for iter = 1:nIterations
+   fprintf('\n================ ITERATION %d / %d ================\n', iter, nIterations);
+   iterResults = repmat(emptyResultStruct(), nParticles, 1);
+   for p = 1:nParticles
+       A_MHz    = pos(p,1);
+       fm_Hz    = pos(p,2);
+       stepSize = pos(p,3);
+       fprintf('\nParticle %d / %d\n', p, nParticles);
+       fprintf('A = %.1f MHz | fm = %.1f Hz | step = %.1f MHz\n', A_MHz, fm_Hz, stepSize);
+       try
+           dataStruct = runExperimentSerial( ...
+               s, centerFreq, span, stepSize, A_MHz, fm_Hz, ...
+               numSweeps, lockinAvg, adcAvg, showLiveParticleRuns, iter, p);
+           metrics = evaluateSweepSet(dataStruct.freq, dataStruct.allData);
+           iterResults(p).A         = A_MHz;
+           iterResults(p).fm        = fm_Hz;
+           iterResults(p).stepSize  = stepSize;
+           iterResults(p).signalP2P = metrics.signalP2P;
+           iterResults(p).noiseP2P  = metrics.noiseP2P;
+           iterResults(p).snr       = metrics.snr;
+           iterResults(p).freq      = dataStruct.freq;
+           iterResults(p).allData   = dataStruct.allData;
+           iterResults(p).avgSignal = metrics.avgSignal;
+           iterResults(p).success   = true;
+           fprintf('  Signal p2p = %.6f\n', metrics.signalP2P);
+           fprintf('  Noise  p2p = %.6f\n', metrics.noiseP2P);
+           fprintf('  SNR        = %.6f\n', metrics.snr);
+       catch ME
+           warning('Particle %d failed: %s', p, ME.message);
+           iterResults(p).A         = A_MHz;
+           iterResults(p).fm        = fm_Hz;
+           iterResults(p).stepSize  = stepSize;
+           iterResults(p).signalP2P = 0;
+           iterResults(p).noiseP2P  = inf;
+           iterResults(p).snr       = 0;
+           iterResults(p).success   = false;
+       end
+   end
+   %% ---------- Normalize and score this iteration ----------
+   snrVals    = [iterResults.snr];
+   signalVals = [iterResults.signalP2P];
+   snrNorm    = normalizeTo01Safe(snrVals);
+   signalNorm = normalizeTo01Safe(signalVals);
+   for p = 1:nParticles
+       if iterResults(p).success
+           iterResults(p).snrNorm    = snrNorm(p);
+           iterResults(p).signalNorm = signalNorm(p);
+           iterResults(p).score      = wSNR*snrNorm(p) + wSignal*signalNorm(p);
+       else
+           iterResults(p).snrNorm    = 0;
+           iterResults(p).signalNorm = 0;
+           iterResults(p).score      = -inf;
+       end
+   end
+   %% ---------- Update personal/global best ----------
+   for p = 1:nParticles
+       if iterResults(p).score > pBestScore(p)
+           pBestScore(p) = iterResults(p).score;
+           pBestPos(p,:) = pos(p,:);
+           pBestData(p)  = iterResults(p);
+       end
+       if iterResults(p).score > gBestScore
+           gBestScore = iterResults(p).score;
+           gBestPos   = pos(p,:);
+           gBestData  = iterResults(p);
+       end
+   end
+   %% ---------- Save history ----------
+   for p = 1:nParticles
+       row.iter      = iter;
+       row.particle  = p;
+       row.A         = pos(p,1);
+       row.fm        = pos(p,2);
+       row.stepSize  = pos(p,3);
+       row.signalP2P = iterResults(p).signalP2P;
+       row.noiseP2P  = iterResults(p).noiseP2P;
+       row.snr       = iterResults(p).snr;
+       row.score     = iterResults(p).score;
+       row.success   = iterResults(p).success;
+       history = [history; row]; %#ok<AGROW>
+   end
+   %% ---------- Print best so far ----------
+   fprintf('\n***** GLOBAL BEST AFTER ITERATION %d *****\n', iter);
+   fprintf('A        = %.1f MHz\n', gBestPos(1));
+   fprintf('fm       = %.1f Hz\n', gBestPos(2));
+   fprintf('stepSize = %.1f MHz\n', gBestPos(3));
+   fprintf('score    = %.6f\n', gBestScore);
+   fprintf('SNR      = %.6f\n', gBestData.snr);
+   fprintf('signal   = %.6f\n', gBestData.signalP2P);
+   fprintf('noise    = %.6f\n', gBestData.noiseP2P);
+   %% ---------- PSO update ----------
+   for p = 1:nParticles
+       r1 = rand(1,nVar);
+       r2 = rand(1,nVar);
+       vel(p,:) = w*vel(p,:) ...
+                + c1*r1.*(pBestPos(p,:) - pos(p,:)) ...
+                + c2*r2.*(gBestPos      - pos(p,:));
+       pos(p,:) = pos(p,:) + vel(p,:);
+   end
+   pos = snapAndClamp(pos, lb, ub, AGrid, fmGrid, stepGrid);
+   if showSummaryPlots
+       plotPsoSummary(history, iter, gBestData);
+   end
+end
+%% ================= FINAL OUTPUT =================
+fprintf('\n================ FINAL BEST =================\n');
+fprintf('A        = %.1f MHz\n', gBestPos(1));
+fprintf('fm       = %.1f Hz\n', gBestPos(2));
+fprintf('stepSize = %.1f MHz\n', gBestPos(3));
+fprintf('score    = %.6f\n', gBestScore);
+fprintf('SNR      = %.6f\n', gBestData.snr);
+fprintf('signal   = %.6f\n', gBestData.signalP2P);
+fprintf('noise    = %.6f\n', gBestData.noiseP2P);
+if ~isempty(gBestData.freq)
+   figure(900); clf
+   plot(gBestData.freq, gBestData.avgSignal, 'k', 'LineWidth', 3)
+   grid on
+   xlabel('Frequency (MHz)')
+   ylabel('Average Signal (V)')
+   title(sprintf('Best PSO Result | A=%.1f MHz | fm=%.1f Hz | step=%.1f MHz', ...
+       gBestPos(1), gBestPos(2), gBestPos(3)))
+end
+T = struct2table(history);
+disp(T)
+clear s
+%% ================= LOCAL FUNCTIONS =================
+function pos = snapAndClamp(pos, lb, ub, AGrid, fmGrid, stepGrid)
+   pos = min(max(pos, lb), ub);
+   pos(:,1) = round(pos(:,1)/AGrid)*AGrid;
+   pos(:,2) = round(pos(:,2)/fmGrid)*fmGrid;
+   pos(:,3) = round(pos(:,3)/stepGrid)*stepGrid;
+   pos = min(max(pos, lb), ub);
+end
+function S = emptyResultStruct()
+   S = struct( ...
+       'A', nan, ...
+       'fm', nan, ...
+       'stepSize', nan, ...
+       'signalP2P', nan, ...
+       'noiseP2P', nan, ...
+       'snr', nan, ...
+       'snrNorm', nan, ...
+       'signalNorm', nan, ...
+       'score', nan, ...
+       'freq', [], ...
+       'allData', [], ...
+       'avgSignal', [], ...
+       'success', false);
+end
+function dataStruct = runExperimentSerial(s, centerFreq, span, stepSize, A_MHz, fm_Hz, ...
+                                         numSweeps, lockinAvg, adcAvg, showLiveRun, iter, particle)
+   flush(s);
+   cmd = sprintf('RUN,%.6f,%.6f,%.6f,%.6f,%.6f,%d,%d,%d', ...
+       centerFreq, span, stepSize, A_MHz, fm_Hz, numSweeps, lockinAvg, adcAvg);
+   disp("Sending command: " + cmd)
+   writeline(s, cmd);
+   sweepData = cell(numSweeps,1);
+   currentSweep = 0;
+   gotBeginRun = false;
+   gotEndRun   = false;
+   if showLiveRun
+       figNum = 100 + particle;
+       figure(figNum); clf
+       hold on
+       grid on
+       xlabel('Frequency (MHz)')
+       ylabel('Signal (V)')
+       title(sprintf('Iter %d Particle %d Live', iter, particle))
+       liveLines = gobjects(numSweeps,1);
+       for k = 1:numSweeps
+           liveLines(k) = animatedline('LineWidth', 1.2);
+       end
+       avgLine = plot(nan, nan, 'k', 'LineWidth', 3);
+       hold off
+   else
+       liveLines = [];
+       avgLine = [];
+   end
+   lastDataTime = tic;
+   while ~gotEndRun
+       if s.NumBytesAvailable > 0
+           line = strtrim(readline(s));
+           lastDataTime = tic;
+           disp(line)
+           if strcmp(line, "BEGIN_RUN")
+               gotBeginRun = true;
+               continue
+           end
+           if startsWith(line, "META,")
+               continue
+           end
+           if startsWith(line, "BEGIN_SWEEP,")
+               currentSweep = str2double(extractAfter(line, "BEGIN_SWEEP,"));
+               continue
+           end
+           if startsWith(line, "END_SWEEP,")
+               if showLiveRun
+                   validSweeps = find(~cellfun(@isempty, sweepData));
+                   if ~isempty(validSweeps)
+                       nPts = min(cellfun(@(x) size(x,1), sweepData(validSweeps)));
+                       fAvg = sweepData{validSweeps(1)}(1:nPts,1);
+                       yMat = zeros(nPts, numel(validSweeps));
+                       for kk = 1:numel(validSweeps)
+                           yMat(:,kk) = sweepData{validSweeps(kk)}(1:nPts,2);
+                       end
+                       yAvg = mean(yMat,2);
+                       set(avgLine, 'XData', fAvg, 'YData', yAvg);
+                       drawnow
+                   end
+               end
+               continue
+           end
+           if strcmp(line, "END_RUN")
+               gotEndRun = true;
+               continue
+           end
+           if startsWith(line, "ERROR")
+               error("Arduino error: " + line)
+           end
+           if contains(line, ",")
+               vals = split(line, ",");
+               if numel(vals) == 2
+                   f = str2double(vals{1});
+                   v = str2double(vals{2});
+                   if ~isnan(f) && ~isnan(v) && currentSweep >= 1 && currentSweep <= numSweeps
+                       sweepData{currentSweep}(end+1,:) = [f v]; %#ok<AGROW>
+                       if showLiveRun
+                           addpoints(liveLines(currentSweep), f, v);
+                           drawnow limitrate
+                       end
+                   end
+               end
+           end
+       else
+           if toc(lastDataTime) > 120
+               error('Timed out waiting for Arduino response.')
+           end
+           pause(0.01)
+       end
+   end
+   if ~gotBeginRun
+       error('Did not receive BEGIN_RUN.')
+   end
+   validSweeps = find(~cellfun(@isempty, sweepData));
+   if isempty(validSweeps)
+       error('No sweep data received.')
+   end
+   nPts = min(cellfun(@(x) size(x,1), sweepData(validSweeps)));
+   freq = sweepData{validSweeps(1)}(1:nPts,1);
+   allData = zeros(nPts, numSweeps);
+   for k = 1:numSweeps
+       if isempty(sweepData{k})
+           error('Sweep %d was empty.', k)
+       end
+       allData(:,k) = sweepData{k}(1:nPts,2);
+   end
+   dataStruct.freq    = freq(:);
+   dataStruct.allData = allData;
+end
+function metrics = evaluateSweepSet(freq, allData)
+   avgSignal = mean(allData, 2);
+   signalP2P = max(avgSignal) - min(avgSignal);
+   n = numel(freq);
+   edgeCount = max(3, round(0.20 * n));
+   baselineMask = false(n,1);
+   baselineMask(1:edgeCount) = true;
+   baselineMask(end-edgeCount+1:end) = true;
+   residuals = allData - avgSignal;
+   noiseVals = residuals(baselineMask,:);
+   noiseVals = noiseVals(:);
+   noiseP2P = max(noiseVals) - min(noiseVals);
+   if noiseP2P == 0
+       snr = Inf;
+   else
+       snr = signalP2P / noiseP2P;
+   end
+   metrics.avgSignal = avgSignal;
+   metrics.signalP2P = signalP2P;
+   metrics.noiseP2P  = noiseP2P;
+   metrics.snr       = snr;
+end
+function xNorm = normalizeTo01Safe(x)
+   x = x(:).';
+   finiteMask = isfinite(x);
+   if ~any(finiteMask)
+       xNorm = zeros(size(x));
+       return
+   end
+   xf = x(finiteMask);
+   xmin = min(xf);
+   xmax = max(xf);
+   if xmax == xmin
+       xNorm = zeros(size(x));
+       xNorm(finiteMask) = 1;
+   else
+       xNorm = zeros(size(x));
+       xNorm(finiteMask) = (xf - xmin) ./ (xmax - xmin);
+   end
+end
+function plotPsoSummary(history, iter, gBestData)
+   T = struct2table(history);
+   T = T(T.iter <= iter, :);
+   figure(800); clf
+   subplot(3,1,1)
+   scatter(T.iter, T.snr, 50, T.A, 'filled')
+   grid on
+   xlabel('Iteration')
+   ylabel('SNR')
+   title('SNR by Iteration')
+   cb = colorbar;
+   ylabel(cb, 'A (MHz)')
+   subplot(3,1,2)
+   scatter(T.iter, T.score, 50, T.fm, 'filled')
+   grid on
+   xlabel('Iteration')
+   ylabel('Score')
+   title('Score by Iteration')
+   cb = colorbar;
+   ylabel(cb, 'fm (Hz)')
+   subplot(3,1,3)
+   scatter(T.iter, T.stepSize, 50, T.score, 'filled')
+   grid on
+   xlabel('Iteration')
+   ylabel('Step Size (MHz)')
+   title('Step Size Tried')
+   cb = colorbar;
+   ylabel(cb, 'Score')
+   if ~isempty(gBestData.freq)
+       figure(801); clf
+       plot(gBestData.freq, gBestData.avgSignal, 'k', 'LineWidth', 3)
+       grid on
+       xlabel('Frequency (MHz)')
+       ylabel('Average Signal (V)')
+       title(sprintf('Global Best After Iter %d', iter))
+   end
+end
+
+
