@@ -8,31 +8,31 @@
 #define ADC_PIN   0
 
 // ================= USER SETTINGS =================
-double centerFreq = 2870.0;   // Center frequency for where the middle should be in MHz
-double span       = 200.0;    // How far we will sweep in total (span/2 on each side of the center frequency)
-double stepSize   = 1;        // How far we step each time in MHz
-int sweepDelay    = 10;
+double centerFreq = 2870.0;   // Center frequency in MHz
+double span       = 200.0;    // Total sweep span in MHz
+double stepSize   = 0.8;      // Sweep step size in MHz
+int sweepDelay    = 10;       // Delay between sweep points in ms
 
 // ================= LOCK-IN SETTINGS =================
-// Equation is sin[2π(f0 + Asin(fmt))t]
-// f0 is the carrier frequency
-// A is the amplitude of the modulated signal
-// fm is the modulation frequency
-// settleTimeUs is the modulation freqeuncy. We find it using this for loop as an example
-/*
-    for(double fm = 100; fm <= 1000; fm += 10)
-    {
-        settleTimeUs = 500.0 / fm;
-    }
-*/
-double fmDevMHz      = 26.8;  // frequency hop (A in above equation)
-int settleTimeUs     = 3000;  // PLL settling time
-int lockinAverages   = 100;   // number of lock-in cycles
-int adcSamples       = 32;
+// This code does two-point frequency dither:
+// high = f + A
+// low  = f - A
+//
+// A = modulation depth in MHz
+// fm = effective modulation frequency in Hz
+//
+// Since this is a two-state hop system, we approximate the modulation
+// timing using the half-period of fm.
+
+double fmDevMHz      = 11.0;   // A = modulation depth in MHz
+double fmHz          = 640.0;  // modulation frequency in Hz
+int settleTimeUs     = 781;    // half-period of 640 Hz ≈ 781 us
+int lockinAverages   = 100;    // number of lock-in cycles to average
+int adcSamples       = 32;     // ADC samples per point
 
 // ================= PLL CONSTANTS =================
-// Output frequency = (fPFD × (INT + FRAC/MOD)) / divider 
-double fPFD = 25.0;         // fPFD = phase detector frequency
+// Output frequency = (fPFD × (INT + FRAC/MOD)) / divider
+double fPFD = 25.0;
 unsigned long MOD = 1000;
 
 #define DELAY 1
@@ -45,7 +45,7 @@ unsigned long MOD = 1000;
 
 uint8_t currentRfDiv = 0;
 
-// Function to get the right values in the registers for each step
+// Function to write a 32-bit register to the PLL
 void write_register(unsigned long value)
 {
   digitalWrite(LE_PIN, LOW);
@@ -62,7 +62,7 @@ void write_register(unsigned long value)
   delayMicroseconds(DELAY);
 }
 
-// Function to get the dividers for the registers to get proper output signals
+// Function to determine RF divider settings
 void getDividerInfo(double freqMHz, uint8_t &rfDiv, uint32_t &divider)
 {
   if (freqMHz >= 2200.0)      { rfDiv = 0; divider = 1; }
@@ -74,20 +74,16 @@ void getDividerInfo(double freqMHz, uint8_t &rfDiv, uint32_t &divider)
   else                        { rfDiv = 6; divider = 64; }
 }
 
-// Function to calculate the PLL parameters 
+// Function to fully program PLL registers
 void programFrequencyFull(double freqMHz)
 {
   uint8_t rfDiv;
   uint32_t divider;
   getDividerInfo(freqMHz, rfDiv, divider);
 
-  // Converts the output frequency to VCO frequency
   double vcoFreq = freqMHz * divider;
-
-  // Calculates the divider frequency 
   double N = vcoFreq / fPFD;
 
-  // Splits into integer and fractinoal parts
   unsigned long INT  = (unsigned long)N;
   unsigned long FRAC = (unsigned long)((N - INT) * MOD + 0.5);
 
@@ -98,12 +94,10 @@ void programFrequencyFull(double freqMHz)
 
   currentRfDiv = rfDiv;
 
-  // Builds the register values
   unsigned long reg4 = (REG4_BASE & REG4_MASK) | ((unsigned long)rfDiv << 20);
   unsigned long reg1 = (MOD << 3) | 0x01;
   unsigned long reg0 = (INT << 15) | (FRAC << 3);
 
-  // Writes our register values to the right registers
   write_register(REGISTER_5);
   write_register(reg4);
   write_register(REGISTER_3);
@@ -112,8 +106,7 @@ void programFrequencyFull(double freqMHz)
   write_register(reg0);
 }
 
-// Function to only update register 0 when sweeping to make it faster
-// Similar function to the previous one, but only updates register 0 for quicker sweeping
+// Faster frequency update using only register 0 when possible
 void setFrequencyFast(double freqMHz)
 {
   uint8_t rfDiv;
@@ -140,39 +133,37 @@ void setFrequencyFast(double freqMHz)
   write_register(reg0);
 }
 
-// Function to read our voltage properly
+// Function to read averaged ADC voltage
 double readAveragedVoltage(int samples)
 {
   long sum = 0;
 
-  // Read value from ADC pin and sum them
-  for (int i = 0; i < samples; i++)
+  for (int i = 0; i < samples; i++) {
     sum += analogRead(ADC_PIN);
+  }
 
-  // Averaging for the values read in and put into voltage scaled for 3.3V
   double adc = (double)sum / samples;
   return (adc / 4095.0) * 3.3;
 }
 
-// Function for doing Lock-In
+// Two-point lock-in style measurement
 double measureLockin(double f)
 {
   double accumulator = 0;
 
-  for(int i = 0; i < lockinAverages; i++)
+  for (int i = 0; i < lockinAverages; i++)
   {
-    // First, measure at high frequency
+    // High side: f + A
     setFrequencyFast(f + fmDevMHz);
     delayMicroseconds(settleTimeUs);
     double high = readAveragedVoltage(adcSamples);
 
-    // Next, measure at low frequency 
+    // Low side: f - A
     setFrequencyFast(f - fmDevMHz);
     delayMicroseconds(settleTimeUs);
     double low = readAveragedVoltage(adcSamples);
 
-    // Next, take the difference between them and take a bunch of samples to average 
-    // This will give the derivative plot
+    // Difference gives derivative-like signal
     accumulator += (high - low);
   }
 
@@ -181,55 +172,48 @@ double measureLockin(double f)
 
 void setup()
 {
-  // For MATLAB communication
   Serial.begin(115200);
 
-  // Configuring all PLL pins
   pinMode(PDB, OUTPUT);
   pinMode(LE_PIN, OUTPUT);
   pinMode(CE_PIN, OUTPUT);
   pinMode(CLK_PIN, OUTPUT);
   pinMode(DATA_PIN, OUTPUT);
 
-  // Enabling the pins
   digitalWrite(PDB, HIGH);
   digitalWrite(LE_PIN, HIGH);
   digitalWrite(CE_PIN, HIGH);
 
-  // Configuring the ADC
   analogReadResolution(12);
   analogSetAttenuation(ADC_11db);
 
   delay(1000);
 
-  // Sets the initial frequncy
+  // Program initial frequency
   programFrequencyFull(centerFreq);
 
-  // Sets the csv header
+  // CSV header for MATLAB
   Serial.println("Frequency_MHz,Voltage_V");
 
-  // Gets our starting and ending frequencies
-  double startFreq = centerFreq - span/2;
-  double endFreq   = centerFreq + span/2;
+  double startFreq = centerFreq - span / 2.0;
+  double endFreq   = centerFreq + span / 2.0;
 
-  // Loop for the sweep
-  for(double f = startFreq; f <= endFreq; f += stepSize)
+  for (double f = startFreq; f <= endFreq; f += stepSize)
   {
-    // Set the frequency at each step and delay
     setFrequencyFast(f);
     delay(sweepDelay);
 
-    // Measure the lock-in value at that point 
     double lockin = measureLockin(f);
 
-    // Send the data to read in MATLAB
-    Serial.print(f,4);
+    Serial.print(f, 4);
     Serial.print(",");
-    Serial.println(lockin,6);
+    Serial.println(lockin, 6);
   }
 
-  // Return to center frequency when done
+  // Return to center frequency
   setFrequencyFast(centerFreq);
 }
 
-void loop(){} 
+void loop() {}
+
+
