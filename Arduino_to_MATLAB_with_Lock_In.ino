@@ -9,7 +9,7 @@
 
 // ================= USER SETTINGS =================
 double centerFreq = 2870.0;   // Center frequency in MHz
-double span       = 200.0;    // Total sweep span in MHz
+double span       = 70.0;    // Total sweep span in MHz
 double stepSize   = 0.8;      // Sweep step size in MHz
 int sweepDelay    = 10;       // Delay between sweep points in ms
 
