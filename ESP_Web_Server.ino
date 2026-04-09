@@ -12,10 +12,16 @@
 
 // ================= USER SETTINGS =================
 double centerFreq = 2870.0;   // MHz
-double span       = 75.0;     // MHz total span
+double span       = 300.0;    // MHz total span
 double stepSize   = 0.8;      // MHz step size
 int sweepDelay    = 10;       // ms delay after frequency step
 int numOfPoints   = 150;      // number of averaged voltage points per frequency
+
+// ===== Parked-mode settings =====
+int parkedSettleDelay = 10;                  // ms after each parked/reference frequency set
+unsigned long parkedUpdateIntervalMs = 500; // how often parked mode updates
+unsigned long autoResweepIntervalMs   = 600000UL; // 10 minutes
+bool autoResweepEnabled = true;
 
 // ================= PLL CONSTANTS =================
 double fPFD = 25.0;
@@ -37,7 +43,7 @@ const char* apPASS = "12345678";
 WebServer server(80);
 
 // ================= SWEEP STORAGE =================
-const int MAX_POINTS = 128;
+const int MAX_POINTS = 512;
 double freqData[MAX_POINTS];
 double voltData[MAX_POINTS];
 int pointCount = 0;
@@ -50,10 +56,68 @@ double rightDipVolt   = 0.0;
 double magneticFieldG = 0.0;
 unsigned long sweepNumber = 0;
 
+// ===== Parked mode/calibration results =====
+double parkedFreqMHz          = 0.0;
+double refFreqMHz             = 0.0;
+double parkedSlopeNormPerMHz  = 0.0;
+double baselineNormSignal     = 0.0;
+double baselineParkVolt       = 0.0;
+double baselineRefVolt        = 0.0;
+double baselineField_uT       = 0.0;
+double currentParkVolt        = 0.0;
+double currentRefVolt         = 0.0;
+double currentNormSignal      = 0.0;
+double deltaField_uT          = 0.0;
+double currentField_uT        = 0.0;
+bool parkedCalibrationValid   = false;
+
 // ================= CONTROL FLAGS =================
 bool continuousSweepEnabled = false;
 bool requestSingleSweep     = false;
 bool sweepInProgress        = false;
+
+bool parkedModeEnabled      = false;
+bool requestParkedCal       = false;
+
+// ================= TIMERS =================
+unsigned long lastParkedUpdateMs = 0;
+unsigned long lastResweepMs      = 0;
+
+// ============================================================
+// HELPER FUNCTIONS
+// ============================================================
+double clampNonZero(double x, double minVal = 1e-9) {
+  if (x >= 0.0 && x < minVal) return minVal;
+  if (x < 0.0 && x > -minVal) return -minVal;
+  return x;
+}
+
+double avgRange(double* arr, int startIdx, int endIdx) {
+  if (pointCount <= 0) return 0.0;
+  if (startIdx < 0) startIdx = 0;
+  if (endIdx >= pointCount) endIdx = pointCount - 1;
+  if (endIdx < startIdx) return 0.0;
+
+  double sum = 0.0;
+  int count = 0;
+  for (int i = startIdx; i <= endIdx; i++) {
+    sum += arr[i];
+    count++;
+  }
+  if (count == 0) return 0.0;
+  return sum / count;
+}
+
+double smoothedVoltAt(int idx) {
+  int startIdx = idx - 2;
+  int endIdx   = idx + 2;
+  return avgRange(voltData, startIdx, endIdx);
+}
+
+int getExpectedSweepPoints() {
+  if (stepSize <= 0.0) return 0;
+  return (int)(span / stepSize) + 1;
+}
 
 // ============================================================
 // HTML PAGE
@@ -89,7 +153,7 @@ const char webpage[] PROGMEM = R"rawliteral(
       box-shadow: 0 0 10px rgba(0,0,0,0.35);
     }
     .stats {
-      min-width: 300px;
+      min-width: 340px;
       flex: 1;
     }
     .graph {
@@ -103,8 +167,9 @@ const char webpage[] PROGMEM = R"rawliteral(
       color: #4fc3f7;
     }
     .small {
-      font-size: 16px;
+      font-size: 15px;
       margin: 6px 0;
+      line-height: 1.45;
     }
     .mode {
       margin-top: 14px;
@@ -128,15 +193,12 @@ const char webpage[] PROGMEM = R"rawliteral(
       cursor: pointer;
       color: white;
     }
-    #singleBtn {
-      background: #1976d2;
-    }
-    #contBtn {
-      background: #2e7d32;
-    }
-    button:hover {
-      opacity: 0.9;
-    }
+    #singleBtn { background: #1976d2; }
+    #contBtn   { background: #2e7d32; }
+    #parkBtn   { background: #8e24aa; }
+    #saveBtn   { background: #ef6c00; }
+    button:hover { opacity: 0.9; }
+
     canvas {
       width: 100%;
       max-width: 100%;
@@ -145,10 +207,48 @@ const char webpage[] PROGMEM = R"rawliteral(
       border-radius: 8px;
       border: 1px solid #444;
     }
+
     .footer {
       margin-top: 10px;
       color: #aaa;
       font-size: 14px;
+    }
+
+    .sectionTitle {
+      margin-top: 16px;
+      margin-bottom: 8px;
+      font-size: 17px;
+      color: #ffd54f;
+    }
+
+    .settingsGrid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+      margin-top: 10px;
+    }
+
+    .settingsGrid label {
+      font-size: 13px;
+      color: #ccc;
+      display: block;
+      margin-bottom: 4px;
+    }
+
+    .settingsGrid input {
+      width: 100%;
+      box-sizing: border-box;
+      padding: 8px;
+      border-radius: 8px;
+      border: 1px solid #444;
+      background: #0f0f0f;
+      color: white;
+    }
+
+    #settingsMsg {
+      margin-top: 10px;
+      font-size: 14px;
+      color: #90caf9;
     }
   </style>
 </head>
@@ -157,34 +257,123 @@ const char webpage[] PROGMEM = R"rawliteral(
 
   <div class="wrap">
     <div class="card stats">
-      <div class="small">Magnetic Field</div>
-      <div class="value" id="bfield">Loading...</div>
+      <div class="small">Current Magnetic Field Estimate</div>
+      <div class="value" id="bfielduT">Loading...</div>
 
+      <div class="small">ΔB from parked baseline: <span id="deltaB">--</span> µT</div>
+      <div class="small">Baseline field from sweep: <span id="baselineB">--</span> µT</div>
+
+      <div class="sectionTitle">Sweep Results</div>
       <div class="small">Left Dip: <span id="leftDip">--</span> MHz</div>
       <div class="small">Right Dip: <span id="rightDip">--</span> MHz</div>
       <div class="small">Sweep #: <span id="sweepNum">--</span></div>
-      <div class="small">Points: <span id="pointCount">--</span></div>
+      <div class="small">Actual Points: <span id="pointCount">--</span></div>
+      <div class="small">Expected Points: <span id="expectedPoints">--</span></div>
+
+      <div class="sectionTitle">Parked Measurement</div>
+      <div class="small">Parked Frequency: <span id="parkFreq">--</span> MHz</div>
+      <div class="small">Reference Frequency: <span id="refFreq">--</span> MHz</div>
+      <div class="small">Parked Voltage: <span id="parkVolt">--</span> V</div>
+      <div class="small">Reference Voltage: <span id="refVolt">--</span> V</div>
+      <div class="small">Normalized Signal: <span id="normSig">--</span></div>
+      <div class="small">Baseline Normalized Signal: <span id="baseNormSig">--</span></div>
+      <div class="small">Slope d(Norm)/df: <span id="slopeNorm">--</span> /MHz</div>
+      <div class="small">Calibration Valid: <span id="calValid">--</span></div>
 
       <div class="mode">
         Mode: <span id="modeText">Idle</span><br>
-        Sweep In Progress: <span id="busyText">No</span>
+        Sweep In Progress: <span id="busyText">No</span><br>
+        Auto-Resweep: <span id="autoResweepText">--</span>
       </div>
 
       <div class="btnRow">
         <button id="singleBtn" onclick="runSingleSweep()">Single Sweep</button>
         <button id="contBtn" onclick="toggleContinuousSweep()">Continuous Sweep</button>
+        <button id="parkBtn" onclick="toggleParkedMode()">Parked Measurement</button>
       </div>
+
+      <div class="sectionTitle">Sweep Settings</div>
+      <div class="settingsGrid">
+        <div>
+          <label>Center Frequency (MHz)</label>
+          <input id="centerFreqInput" type="number" step="0.1">
+        </div>
+        <div>
+          <label>Span (MHz)</label>
+          <input id="spanInput" type="number" step="0.1">
+        </div>
+        <div>
+          <label>Step Size (MHz)</label>
+          <input id="stepSizeInput" type="number" step="0.1">
+        </div>
+        <div>
+          <label>Sweep Delay (ms)</label>
+          <input id="sweepDelayInput" type="number" step="1">
+        </div>
+        <div>
+          <label>Avg Points per Freq</label>
+          <input id="numOfPointsInput" type="number" step="1">
+        </div>
+      </div>
+
+      <div class="btnRow">
+        <button id="saveBtn" onclick="saveSettings()">Save Settings</button>
+      </div>
+      <div id="settingsMsg">No changes yet.</div>
     </div>
 
     <div class="card graph">
       <canvas id="plot" width="900" height="420"></canvas>
-      <div class="footer">Latest microwave sweep</div>
+      <div class="footer">Latest microwave sweep with auto-selected parked/reference frequencies</div>
     </div>
   </div>
 
   <script>
     const canvas = document.getElementById('plot');
     const ctx = canvas.getContext('2d');
+
+    const settingsInputIds = [
+      'centerFreqInput',
+      'spanInput',
+      'stepSizeInput',
+      'sweepDelayInput',
+      'numOfPointsInput'
+    ];
+
+    let settingsInitialized = false;
+    let settingsDirty = false;
+
+    function setupSettingsInputs() {
+      settingsInputIds.forEach((id) => {
+        const el = document.getElementById(id);
+        el.addEventListener('input', () => {
+          settingsDirty = true;
+        });
+      });
+    }
+
+    function isEditingSettings() {
+      const active = document.activeElement;
+      return active && settingsInputIds.includes(active.id);
+    }
+
+    function updateSettingsInputs(data, force = false) {
+      if (!force) {
+        if (!settingsInitialized && !settingsDirty) {
+          // first load is allowed
+        } else if (settingsDirty || isEditingSettings()) {
+          return;
+        }
+      }
+
+      document.getElementById('centerFreqInput').value = data.centerFreq;
+      document.getElementById('spanInput').value = data.span;
+      document.getElementById('stepSizeInput').value = data.stepSize;
+      document.getElementById('sweepDelayInput').value = data.sweepDelay;
+      document.getElementById('numOfPointsInput').value = data.numOfPoints;
+
+      settingsInitialized = true;
+    }
 
     async function runSingleSweep() {
       try {
@@ -202,7 +391,56 @@ const char webpage[] PROGMEM = R"rawliteral(
       }
     }
 
-    function drawPlot(freq, volt, leftDip, rightDip) {
+    async function toggleParkedMode() {
+      try {
+        await fetch('/parked', { method: 'POST' });
+      } catch (err) {
+        console.log('Parked toggle error:', err);
+      }
+    }
+
+    async function saveSettings() {
+      const body =
+        "centerFreq=" + encodeURIComponent(document.getElementById('centerFreqInput').value) +
+        "&span=" + encodeURIComponent(document.getElementById('spanInput').value) +
+        "&stepSize=" + encodeURIComponent(document.getElementById('stepSizeInput').value) +
+        "&sweepDelay=" + encodeURIComponent(document.getElementById('sweepDelayInput').value) +
+        "&numOfPoints=" + encodeURIComponent(document.getElementById('numOfPointsInput').value);
+
+      try {
+        const response = await fetch('/settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: body
+        });
+
+        const text = await response.text();
+        document.getElementById('settingsMsg').textContent = text;
+
+        if (response.ok) {
+          settingsDirty = false;
+          settingsInitialized = false;
+          setTimeout(fetchData, 150);
+        }
+      } catch (err) {
+        document.getElementById('settingsMsg').textContent = "Failed to save settings.";
+        console.log('Settings save error:', err);
+      }
+    }
+
+    function drawVerticalMarker(xVal, color, minX, maxX, padL, padR, padT, padB, w, h) {
+      if (!isFinite(xVal)) return;
+      const plotW = w - padL - padR;
+      const x = padL + ((xVal - minX) / (maxX - minX)) * plotW;
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(x, padT);
+      ctx.lineTo(x, h - padB);
+      ctx.stroke();
+    }
+
+    function drawPlot(freq, volt, leftDip, rightDip, parkedFreq, refFreq) {
       const w = canvas.width;
       const h = canvas.height;
       const padL = 70;
@@ -211,8 +449,6 @@ const char webpage[] PROGMEM = R"rawliteral(
       const padB = 45;
 
       ctx.clearRect(0, 0, w, h);
-
-      // Background
       ctx.fillStyle = "#000";
       ctx.fillRect(0, 0, w, h);
 
@@ -244,7 +480,6 @@ const char webpage[] PROGMEM = R"rawliteral(
         return padT + (1 - (y - minY) / (maxY - minY)) * plotH;
       }
 
-      // Grid
       ctx.strokeStyle = "#333";
       ctx.lineWidth = 1;
       const gridLines = 5;
@@ -263,7 +498,6 @@ const char webpage[] PROGMEM = R"rawliteral(
         ctx.stroke();
       }
 
-      // Axes
       ctx.strokeStyle = "#aaa";
       ctx.lineWidth = 1.5;
       ctx.beginPath();
@@ -272,7 +506,6 @@ const char webpage[] PROGMEM = R"rawliteral(
       ctx.lineTo(w - padR, h - padB);
       ctx.stroke();
 
-      // Plot line
       ctx.strokeStyle = "#33aaff";
       ctx.lineWidth = 2.5;
       ctx.beginPath();
@@ -282,28 +515,16 @@ const char webpage[] PROGMEM = R"rawliteral(
       }
       ctx.stroke();
 
-      // Dip markers
-      function drawMarker(xVal, color) {
-        if (!isFinite(xVal)) return;
-        const x = xMap(xVal);
-        ctx.strokeStyle = color;
-        ctx.lineWidth = 2;
-        ctx.beginPath();
-        ctx.moveTo(x, padT);
-        ctx.lineTo(x, h - padB);
-        ctx.stroke();
-      }
+      drawVerticalMarker(leftDip,   "#ff5252", minX, maxX, padL, padR, padT, padB, w, h);
+      drawVerticalMarker(rightDip,  "#00e676", minX, maxX, padL, padR, padT, padB, w, h);
+      drawVerticalMarker(parkedFreq,"#ffd54f", minX, maxX, padL, padR, padT, padB, w, h);
+      drawVerticalMarker(refFreq,   "#ab47bc", minX, maxX, padL, padR, padT, padB, w, h);
 
-      drawMarker(leftDip, "#ff5252");
-      drawMarker(rightDip, "#00e676");
-
-      // Labels
       ctx.fillStyle = "#ddd";
       ctx.font = "16px Arial";
       ctx.fillText("Voltage (V)", 10, 22);
       ctx.fillText("Frequency (MHz)", w / 2 - 55, h - 8);
 
-      // X axis numbers
       ctx.fillStyle = "#bbb";
       ctx.font = "13px Arial";
       for (let i = 0; i <= gridLines; i++) {
@@ -312,7 +533,6 @@ const char webpage[] PROGMEM = R"rawliteral(
         ctx.fillText(xVal.toFixed(1), x - 14, h - padB + 20);
       }
 
-      // Y axis numbers
       for (let i = 0; i <= gridLines; i++) {
         let yVal = maxY - (i / gridLines) * (maxY - minY);
         let y = padT + (i / gridLines) * plotH;
@@ -325,23 +545,48 @@ const char webpage[] PROGMEM = R"rawliteral(
         const response = await fetch('/data');
         const data = await response.json();
 
-        document.getElementById('bfield').textContent = data.magneticFieldG.toFixed(4) + " G";
+        document.getElementById('bfielduT').textContent = data.currentField_uT.toFixed(3) + " µT";
+        document.getElementById('deltaB').textContent = data.deltaField_uT.toFixed(3);
+        document.getElementById('baselineB').textContent = data.baselineField_uT.toFixed(3);
+
         document.getElementById('leftDip').textContent = data.leftDipFreq.toFixed(3);
         document.getElementById('rightDip').textContent = data.rightDipFreq.toFixed(3);
         document.getElementById('sweepNum').textContent = data.sweepNumber;
         document.getElementById('pointCount').textContent = data.pointCount;
+        document.getElementById('expectedPoints').textContent = data.expectedSweepPoints;
+
+        document.getElementById('parkFreq').textContent = data.parkedFreqMHz.toFixed(3);
+        document.getElementById('refFreq').textContent = data.refFreqMHz.toFixed(3);
+        document.getElementById('parkVolt').textContent = data.currentParkVolt.toFixed(6);
+        document.getElementById('refVolt').textContent = data.currentRefVolt.toFixed(6);
+        document.getElementById('normSig').textContent = data.currentNormSignal.toFixed(6);
+        document.getElementById('baseNormSig').textContent = data.baselineNormSignal.toFixed(6);
+        document.getElementById('slopeNorm').textContent = data.parkedSlopeNormPerMHz.toFixed(6);
+        document.getElementById('calValid').textContent = data.parkedCalibrationValid ? "Yes" : "No";
+
         document.getElementById('modeText').textContent = data.mode;
         document.getElementById('busyText').textContent = data.sweepInProgress ? "Yes" : "No";
+        document.getElementById('autoResweepText').textContent = data.autoResweepEnabled ? "Enabled" : "Disabled";
 
-        drawPlot(data.freq, data.volt, data.leftDipFreq, data.rightDipFreq);
+        updateSettingsInputs(data);
+
+        drawPlot(
+          data.freq,
+          data.volt,
+          data.leftDipFreq,
+          data.rightDipFreq,
+          data.parkedFreqMHz,
+          data.refFreqMHz
+        );
 
       } catch (err) {
         console.log("Fetch error:", err);
       }
     }
 
+    setupSettingsInputs();
     fetchData();
-    setInterval(fetchData, 1000);
+    setInterval(fetchData, 500);
   </script>
 </body>
 </html>
@@ -423,6 +668,15 @@ double readAveragedVoltage() {
   return avgVolt;
 }
 
+double measureVoltageAtFrequency(double freqMHz) {
+  setFrequency(freqMHz);
+  delay(parkedSettleDelay);
+  return readAveragedVoltage();
+}
+
+// ============================================================
+// DIP FINDING / FIELD ESTIMATION
+// ============================================================
 void findDipsAndField() {
   if (pointCount < 3) {
     leftDipFreq = 0;
@@ -436,7 +690,6 @@ void findDipsAndField() {
   int leftIndex = -1;
   int rightIndex = -1;
 
-  // Find minimum on left side of center
   for (int i = 0; i < pointCount; i++) {
     if (freqData[i] < centerFreq) {
       if (leftIndex == -1 || voltData[i] < voltData[leftIndex]) {
@@ -445,7 +698,6 @@ void findDipsAndField() {
     }
   }
 
-  // Find minimum on right side of center
   for (int i = 0; i < pointCount; i++) {
     if (freqData[i] > centerFreq) {
       if (rightIndex == -1 || voltData[i] < voltData[rightIndex]) {
@@ -472,15 +724,132 @@ void findDipsAndField() {
   }
 }
 
+// ============================================================
+// PARKED MODE CALIBRATION
+// ============================================================
+void updateParkedCalibrationFromSweep() {
+  parkedCalibrationValid = false;
+
+  if (pointCount < 7) return;
+
+  int edgeWindow = min(8, pointCount / 4);
+  if (edgeWindow < 3) edgeWindow = 3;
+
+  double leftEdgeAvg  = avgRange(voltData, 0, edgeWindow - 1);
+  double rightEdgeAvg = avgRange(voltData, pointCount - edgeWindow, pointCount - 1);
+
+  int refIndex = 0;
+  if (rightEdgeAvg >= leftEdgeAvg) {
+    refIndex = pointCount - edgeWindow / 2 - 1;
+  } else {
+    refIndex = edgeWindow / 2;
+  }
+
+  int bestSlopeIndex = -1;
+  double bestAbsSlope = 0.0;
+
+  for (int i = 2; i < pointCount - 2; i++) {
+    double vPrev = smoothedVoltAt(i - 1);
+    double vNext = smoothedVoltAt(i + 1);
+    double fPrev = freqData[i - 1];
+    double fNext = freqData[i + 1];
+    double df = fNext - fPrev;
+    if (fabs(df) < 1e-9) continue;
+
+    double slope = (vNext - vPrev) / df;
+    double absSlope = fabs(slope);
+
+    if (abs(i - refIndex) < 4) continue;
+
+    if (absSlope > bestAbsSlope) {
+      bestAbsSlope = absSlope;
+      bestSlopeIndex = i;
+    }
+  }
+
+  if (bestSlopeIndex < 2) return;
+
+  parkedFreqMHz = freqData[bestSlopeIndex];
+  refFreqMHz    = freqData[refIndex];
+
+  if (fabs(parkedFreqMHz - refFreqMHz) < 8.0) {
+    if (refIndex < pointCount / 2) {
+      refIndex = pointCount - 2;
+    } else {
+      refIndex = 1;
+    }
+    refFreqMHz = freqData[refIndex];
+  }
+
+  double refVoltSweep = smoothedVoltAt(refIndex);
+  refVoltSweep = clampNonZero(refVoltSweep);
+
+  double vPrev = smoothedVoltAt(bestSlopeIndex - 1);
+  double vNext = smoothedVoltAt(bestSlopeIndex + 1);
+  double fPrev = freqData[bestSlopeIndex - 1];
+  double fNext = freqData[bestSlopeIndex + 1];
+  double df = fNext - fPrev;
+
+  if (fabs(df) < 1e-9) return;
+
+  double slopeRaw = (vNext - vPrev) / df;
+  parkedSlopeNormPerMHz = slopeRaw / refVoltSweep;
+
+  if (fabs(parkedSlopeNormPerMHz) < 1e-9) return;
+
+  baselineParkVolt = measureVoltageAtFrequency(parkedFreqMHz);
+  baselineRefVolt  = measureVoltageAtFrequency(refFreqMHz);
+  baselineRefVolt  = clampNonZero(baselineRefVolt);
+  baselineNormSignal = baselineParkVolt / baselineRefVolt;
+
+  currentParkVolt   = baselineParkVolt;
+  currentRefVolt    = baselineRefVolt;
+  currentNormSignal = baselineNormSignal;
+
+  baselineField_uT = magneticFieldG * 100.0;
+  deltaField_uT    = 0.0;
+  currentField_uT  = baselineField_uT;
+
+  parkedCalibrationValid = true;
+}
+
+void updateParkedMeasurement() {
+  if (!parkedCalibrationValid) return;
+
+  currentParkVolt = measureVoltageAtFrequency(parkedFreqMHz);
+  currentRefVolt  = measureVoltageAtFrequency(refFreqMHz);
+  currentRefVolt  = clampNonZero(currentRefVolt);
+
+  currentNormSignal = currentParkVolt / currentRefVolt;
+
+  double deltaNorm = currentNormSignal - baselineNormSignal;
+  double deltaFreqMHz = deltaNorm / parkedSlopeNormPerMHz;
+
+  deltaField_uT = deltaFreqMHz * 35.7142857;
+  currentField_uT = baselineField_uT + deltaField_uT;
+}
+
+// ============================================================
+// SWEEP
+// ============================================================
 void performSweep() {
   sweepInProgress = true;
+
+  int expectedPoints = getExpectedSweepPoints();
+  if (expectedPoints > MAX_POINTS) {
+    Serial.println("ERROR: Sweep settings exceed MAX_POINTS. Sweep aborted.");
+    sweepInProgress = false;
+    return;
+  }
 
   double startFreq = centerFreq - (span / 2.0);
   double endFreq   = centerFreq + (span / 2.0);
 
   pointCount = 0;
 
-  for (double f = startFreq; f <= endFreq && pointCount < MAX_POINTS; f += stepSize) {
+  for (double f = startFreq; f <= endFreq + 1e-9; f += stepSize) {
+    if (pointCount >= MAX_POINTS) break;
+
     setFrequency(f);
     delay(sweepDelay);
 
@@ -490,15 +859,16 @@ void performSweep() {
     voltData[pointCount] = avgVolt;
     pointCount++;
 
-    // Keep webpage responsive during sweep
     server.handleClient();
     delay(1);
   }
 
   setFrequency(centerFreq);
   findDipsAndField();
-  sweepNumber++;
+  updateParkedCalibrationFromSweep();
 
+  sweepNumber++;
+  lastResweepMs = millis();
   sweepInProgress = false;
 }
 
@@ -507,8 +877,10 @@ void performSweep() {
 // ============================================================
 String getModeString() {
   if (sweepInProgress) return "Sweeping";
-  if (continuousSweepEnabled) return "Continuous";
-  if (requestSingleSweep) return "Single Requested";
+  if (continuousSweepEnabled) return "Continuous Sweep";
+  if (parkedModeEnabled) return "Parked Measurement";
+  if (requestSingleSweep) return "Single Sweep Requested";
+  if (requestParkedCal) return "Parked Calibration Requested";
   return "Idle";
 }
 
@@ -525,8 +897,31 @@ void handleData() {
   json += "\"rightDipVolt\":" + String(rightDipVolt, 6) + ",";
   json += "\"sweepNumber\":" + String(sweepNumber) + ",";
   json += "\"pointCount\":" + String(pointCount) + ",";
+  json += "\"expectedSweepPoints\":" + String(getExpectedSweepPoints()) + ",";
   json += "\"sweepInProgress\":" + String(sweepInProgress ? "true" : "false") + ",";
   json += "\"mode\":\"" + getModeString() + "\",";
+  json += "\"parkedModeEnabled\":" + String(parkedModeEnabled ? "true" : "false") + ",";
+  json += "\"parkedCalibrationValid\":" + String(parkedCalibrationValid ? "true" : "false") + ",";
+  json += "\"autoResweepEnabled\":" + String(autoResweepEnabled ? "true" : "false") + ",";
+
+  json += "\"centerFreq\":" + String(centerFreq, 3) + ",";
+  json += "\"span\":" + String(span, 3) + ",";
+  json += "\"stepSize\":" + String(stepSize, 3) + ",";
+  json += "\"sweepDelay\":" + String(sweepDelay) + ",";
+  json += "\"numOfPoints\":" + String(numOfPoints) + ",";
+
+  json += "\"parkedFreqMHz\":" + String(parkedFreqMHz, 6) + ",";
+  json += "\"refFreqMHz\":" + String(refFreqMHz, 6) + ",";
+  json += "\"parkedSlopeNormPerMHz\":" + String(parkedSlopeNormPerMHz, 9) + ",";
+  json += "\"baselineNormSignal\":" + String(baselineNormSignal, 9) + ",";
+  json += "\"baselineParkVolt\":" + String(baselineParkVolt, 6) + ",";
+  json += "\"baselineRefVolt\":" + String(baselineRefVolt, 6) + ",";
+  json += "\"baselineField_uT\":" + String(baselineField_uT, 6) + ",";
+  json += "\"currentParkVolt\":" + String(currentParkVolt, 6) + ",";
+  json += "\"currentRefVolt\":" + String(currentRefVolt, 6) + ",";
+  json += "\"currentNormSignal\":" + String(currentNormSignal, 9) + ",";
+  json += "\"deltaField_uT\":" + String(deltaField_uT, 6) + ",";
+  json += "\"currentField_uT\":" + String(currentField_uT, 6) + ",";
 
   json += "\"freq\":[";
   for (int i = 0; i < pointCount; i++) {
@@ -549,18 +944,79 @@ void handleData() {
 
 void handleSingleSweep() {
   continuousSweepEnabled = false;
+  parkedModeEnabled = false;
   requestSingleSweep = true;
+  requestParkedCal = false;
   server.send(200, "text/plain", "Single sweep requested");
 }
 
 void handleContinuousSweep() {
+  parkedModeEnabled = false;
+  requestParkedCal = false;
   continuousSweepEnabled = !continuousSweepEnabled;
+
   if (continuousSweepEnabled) {
     requestSingleSweep = false;
     server.send(200, "text/plain", "Continuous sweep enabled");
   } else {
     server.send(200, "text/plain", "Continuous sweep disabled");
   }
+}
+
+void handleParkedMode() {
+  continuousSweepEnabled = false;
+  requestSingleSweep = false;
+
+  parkedModeEnabled = !parkedModeEnabled;
+
+  if (parkedModeEnabled) {
+    requestParkedCal = true;
+    server.send(200, "text/plain", "Parked measurement enabled");
+  } else {
+    requestParkedCal = false;
+    server.send(200, "text/plain", "Parked measurement disabled");
+  }
+}
+
+void handleSettings() {
+  if (!server.hasArg("centerFreq") || !server.hasArg("span") || !server.hasArg("stepSize") ||
+      !server.hasArg("sweepDelay") || !server.hasArg("numOfPoints")) {
+    server.send(400, "text/plain", "Missing settings arguments.");
+    return;
+  }
+
+  double newCenterFreq = server.arg("centerFreq").toDouble();
+  double newSpan       = server.arg("span").toDouble();
+  double newStepSize   = server.arg("stepSize").toDouble();
+  int newSweepDelay    = server.arg("sweepDelay").toInt();
+  int newNumOfPoints   = server.arg("numOfPoints").toInt();
+
+  if (newCenterFreq <= 0.0 || newSpan <= 0.0 || newStepSize <= 0.0 || newSweepDelay < 0 || newNumOfPoints <= 0) {
+    server.send(400, "text/plain", "Invalid settings. Stop trying to break physics.");
+    return;
+  }
+
+  int newExpectedPoints = (int)(newSpan / newStepSize) + 1;
+  if (newExpectedPoints > MAX_POINTS) {
+    String msg = "Too many sweep points (" + String(newExpectedPoints) + "). "
+                 "Increase step size or reduce span. MAX_POINTS = " + String(MAX_POINTS);
+    server.send(400, "text/plain", msg);
+    return;
+  }
+
+  centerFreq  = newCenterFreq;
+  span        = newSpan;
+  stepSize    = newStepSize;
+  sweepDelay  = newSweepDelay;
+  numOfPoints = newNumOfPoints;
+
+  continuousSweepEnabled = false;
+  parkedModeEnabled = false;
+  requestSingleSweep = true;
+  requestParkedCal = false;
+
+  String msg = "Settings saved. Expected sweep points = " + String(newExpectedPoints) + ". Running new sweep.";
+  server.send(200, "text/plain", msg);
 }
 
 // ============================================================
@@ -583,7 +1039,6 @@ void setup() {
   analogReadResolution(12);
   analogSetAttenuation(ADC_11db);
 
-  // Start WiFi Access Point
   WiFi.mode(WIFI_AP);
   WiFi.softAP(apSSID, apPASS);
 
@@ -603,11 +1058,12 @@ void setup() {
   server.on("/data", HTTP_GET, handleData);
   server.on("/single", HTTP_POST, handleSingleSweep);
   server.on("/continuous", HTTP_POST, handleContinuousSweep);
+  server.on("/parked", HTTP_POST, handleParkedMode);
+  server.on("/settings", HTTP_POST, handleSettings);
   server.begin();
 
-  // One startup sweep so the page isn't empty on first load.
-  // Delete this line if you want it to start with no data at all.
   performSweep();
+  lastParkedUpdateMs = millis();
 }
 
 void loop() {
@@ -617,9 +1073,24 @@ void loop() {
     if (requestSingleSweep) {
       requestSingleSweep = false;
       performSweep();
-    } 
+    }
+    else if (requestParkedCal) {
+      requestParkedCal = false;
+      performSweep();
+    }
     else if (continuousSweepEnabled) {
       performSweep();
+    }
+    else if (parkedModeEnabled) {
+      unsigned long now = millis();
+
+      if (autoResweepEnabled && (now - lastResweepMs >= autoResweepIntervalMs)) {
+        performSweep();
+      }
+      else if (now - lastParkedUpdateMs >= parkedUpdateIntervalMs) {
+        updateParkedMeasurement();
+        lastParkedUpdateMs = now;
+      }
     }
   }
 
