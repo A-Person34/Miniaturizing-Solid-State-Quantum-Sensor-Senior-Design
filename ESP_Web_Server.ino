@@ -1,5 +1,6 @@
 #include <WiFi.h>
 #include <WebServer.h>
+#include <math.h>
 
 // ================= PIN DEFINITIONS =================
 #define PDB       4
@@ -12,10 +13,16 @@
 
 // ================= USER SETTINGS =================
 double centerFreq = 2870.0;   // MHz
-double span       = 300.0;    // MHz total span
+double span       = 100.0;    // MHz total span
 double stepSize   = 0.8;      // MHz step size
 int sweepDelay    = 10;       // ms delay after frequency step
 int numOfPoints   = 150;      // number of averaged voltage points per frequency
+
+// ===== PDB modulation settings =====
+// Set to 0 for steady HIGH, or set to a frequency in Hz for square-wave modulation.
+uint32_t pdbModFreq = 11000;  // Hz, default = 11 kHz
+const uint8_t pdbPwmResolution = 8;
+const uint32_t pdbPwmDuty = 128; // ~50% duty for 8-bit PWM
 
 // ===== Parked-mode settings =====
 int parkedSettleDelay = 10;                  // ms after each parked/reference frequency set
@@ -82,6 +89,66 @@ bool requestParkedCal       = false;
 // ================= TIMERS =================
 unsigned long lastParkedUpdateMs = 0;
 unsigned long lastResweepMs      = 0;
+
+// ============================================================
+// PWM / PDB MODULATION HELPERS
+// ============================================================
+
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
+  // Arduino ESP32 Core 3.x style
+  void startPdbModulation(uint32_t freqHz) {
+    if (freqHz == 0) {
+      pinMode(PDB, OUTPUT);
+      digitalWrite(PDB, HIGH);
+      return;
+    }
+
+    ledcDetach(PDB); // detach first in case we are changing frequency
+    if (!ledcAttach(PDB, freqHz, pdbPwmResolution)) {
+      pinMode(PDB, OUTPUT);
+      digitalWrite(PDB, HIGH);
+      return;
+    }
+    ledcWrite(PDB, pdbPwmDuty);
+  }
+
+  void stopPdbModulationAndHoldHigh() {
+    ledcDetach(PDB);
+    pinMode(PDB, OUTPUT);
+    digitalWrite(PDB, HIGH);
+  }
+
+#else
+  // Arduino ESP32 Core 2.x style
+  const uint8_t PDB_PWM_CHANNEL = 0;
+
+  void startPdbModulation(uint32_t freqHz) {
+    if (freqHz == 0) {
+      ledcDetachPin(PDB);
+      pinMode(PDB, OUTPUT);
+      digitalWrite(PDB, HIGH);
+      return;
+    }
+
+    ledcSetup(PDB_PWM_CHANNEL, freqHz, pdbPwmResolution);
+    ledcAttachPin(PDB, PDB_PWM_CHANNEL);
+    ledcWrite(PDB_PWM_CHANNEL, pdbPwmDuty);
+  }
+
+  void stopPdbModulationAndHoldHigh() {
+    ledcDetachPin(PDB);
+    pinMode(PDB, OUTPUT);
+    digitalWrite(PDB, HIGH);
+  }
+#endif
+
+void applyPdbMode() {
+  if (pdbModFreq == 0) {
+    stopPdbModulationAndHoldHigh();
+  } else {
+    startPdbModulation(pdbModFreq);
+  }
+}
 
 // ============================================================
 // HELPER FUNCTIONS
@@ -250,6 +317,12 @@ const char webpage[] PROGMEM = R"rawliteral(
       font-size: 14px;
       color: #90caf9;
     }
+
+    .hint {
+      color: #999;
+      font-size: 12px;
+      margin-top: 2px;
+    }
   </style>
 </head>
 <body>
@@ -269,6 +342,10 @@ const char webpage[] PROGMEM = R"rawliteral(
       <div class="small">Sweep #: <span id="sweepNum">--</span></div>
       <div class="small">Actual Points: <span id="pointCount">--</span></div>
       <div class="small">Expected Points: <span id="expectedPoints">--</span></div>
+
+      <div class="sectionTitle">PDB Modulation</div>
+      <div class="small">PDB Mode: <span id="pdbModeText">--</span></div>
+      <div class="small">PDB Frequency: <span id="pdbFreqText">--</span> Hz</div>
 
       <div class="sectionTitle">Parked Measurement</div>
       <div class="small">Parked Frequency: <span id="parkFreq">--</span> MHz</div>
@@ -314,6 +391,11 @@ const char webpage[] PROGMEM = R"rawliteral(
           <label>Avg Points per Freq</label>
           <input id="numOfPointsInput" type="number" step="1">
         </div>
+        <div>
+          <label>PDB Mod Frequency (Hz)</label>
+          <input id="pdbModFreqInput" type="number" step="1" min="0">
+          <div class="hint">Set 0 for steady HIGH. Set 11000 for 11 kHz.</div>
+        </div>
       </div>
 
       <div class="btnRow">
@@ -337,7 +419,8 @@ const char webpage[] PROGMEM = R"rawliteral(
       'spanInput',
       'stepSizeInput',
       'sweepDelayInput',
-      'numOfPointsInput'
+      'numOfPointsInput',
+      'pdbModFreqInput'
     ];
 
     let settingsInitialized = false;
@@ -371,6 +454,7 @@ const char webpage[] PROGMEM = R"rawliteral(
       document.getElementById('stepSizeInput').value = data.stepSize;
       document.getElementById('sweepDelayInput').value = data.sweepDelay;
       document.getElementById('numOfPointsInput').value = data.numOfPoints;
+      document.getElementById('pdbModFreqInput').value = data.pdbModFreq;
 
       settingsInitialized = true;
     }
@@ -405,7 +489,8 @@ const char webpage[] PROGMEM = R"rawliteral(
         "&span=" + encodeURIComponent(document.getElementById('spanInput').value) +
         "&stepSize=" + encodeURIComponent(document.getElementById('stepSizeInput').value) +
         "&sweepDelay=" + encodeURIComponent(document.getElementById('sweepDelayInput').value) +
-        "&numOfPoints=" + encodeURIComponent(document.getElementById('numOfPointsInput').value);
+        "&numOfPoints=" + encodeURIComponent(document.getElementById('numOfPointsInput').value) +
+        "&pdbModFreq=" + encodeURIComponent(document.getElementById('pdbModFreqInput').value);
 
       try {
         const response = await fetch('/settings', {
@@ -554,6 +639,9 @@ const char webpage[] PROGMEM = R"rawliteral(
         document.getElementById('sweepNum').textContent = data.sweepNumber;
         document.getElementById('pointCount').textContent = data.pointCount;
         document.getElementById('expectedPoints').textContent = data.expectedSweepPoints;
+
+        document.getElementById('pdbModeText').textContent = data.pdbModFreq > 0 ? "Square Wave" : "Steady HIGH";
+        document.getElementById('pdbFreqText').textContent = data.pdbModFreq.toFixed(0);
 
         document.getElementById('parkFreq').textContent = data.parkedFreqMHz.toFixed(3);
         document.getElementById('refFreq').textContent = data.refFreqMHz.toFixed(3);
@@ -909,6 +997,7 @@ void handleData() {
   json += "\"stepSize\":" + String(stepSize, 3) + ",";
   json += "\"sweepDelay\":" + String(sweepDelay) + ",";
   json += "\"numOfPoints\":" + String(numOfPoints) + ",";
+  json += "\"pdbModFreq\":" + String(pdbModFreq) + ",";
 
   json += "\"parkedFreqMHz\":" + String(parkedFreqMHz, 6) + ",";
   json += "\"refFreqMHz\":" + String(refFreqMHz, 6) + ",";
@@ -980,7 +1069,7 @@ void handleParkedMode() {
 
 void handleSettings() {
   if (!server.hasArg("centerFreq") || !server.hasArg("span") || !server.hasArg("stepSize") ||
-      !server.hasArg("sweepDelay") || !server.hasArg("numOfPoints")) {
+      !server.hasArg("sweepDelay") || !server.hasArg("numOfPoints") || !server.hasArg("pdbModFreq")) {
     server.send(400, "text/plain", "Missing settings arguments.");
     return;
   }
@@ -990,9 +1079,15 @@ void handleSettings() {
   double newStepSize   = server.arg("stepSize").toDouble();
   int newSweepDelay    = server.arg("sweepDelay").toInt();
   int newNumOfPoints   = server.arg("numOfPoints").toInt();
+  long newPdbModFreq   = server.arg("pdbModFreq").toInt();
 
   if (newCenterFreq <= 0.0 || newSpan <= 0.0 || newStepSize <= 0.0 || newSweepDelay < 0 || newNumOfPoints <= 0) {
-    server.send(400, "text/plain", "Invalid settings. Stop trying to break physics.");
+    server.send(400, "text/plain", "Invalid sweep settings. Stop trying to break physics.");
+    return;
+  }
+
+  if (newPdbModFreq < 0) {
+    server.send(400, "text/plain", "PDB modulation frequency cannot be negative. Nice try.");
     return;
   }
 
@@ -1009,13 +1104,21 @@ void handleSettings() {
   stepSize    = newStepSize;
   sweepDelay  = newSweepDelay;
   numOfPoints = newNumOfPoints;
+  pdbModFreq  = (uint32_t)newPdbModFreq;
+
+  applyPdbMode();
 
   continuousSweepEnabled = false;
   parkedModeEnabled = false;
   requestSingleSweep = true;
   requestParkedCal = false;
 
-  String msg = "Settings saved. Expected sweep points = " + String(newExpectedPoints) + ". Running new sweep.";
+  String pdbMsg = (pdbModFreq == 0)
+    ? "PDB steady HIGH"
+    : ("PDB modulating at " + String(pdbModFreq) + " Hz");
+
+  String msg = "Settings saved. Expected sweep points = " + String(newExpectedPoints) +
+               ". " + pdbMsg + ". Running new sweep.";
   server.send(200, "text/plain", msg);
 }
 
@@ -1032,9 +1135,10 @@ void setup() {
   pinMode(CLK_PIN, OUTPUT);
   pinMode(DATA_PIN, OUTPUT);
 
-  digitalWrite(PDB, HIGH);
   digitalWrite(LE_PIN, HIGH);
   digitalWrite(CE_PIN, HIGH);
+
+  applyPdbMode();
 
   analogReadResolution(12);
   analogSetAttenuation(ADC_11db);
@@ -1052,6 +1156,14 @@ void setup() {
   Serial.print("IP address: ");
   Serial.println(WiFi.softAPIP());
   Serial.println("Open this in your browser: http://192.168.4.1");
+  Serial.println("PDB modulation mode: ");
+  if (pdbModFreq == 0) {
+    Serial.println("Steady HIGH");
+  } else {
+    Serial.print("Square wave at ");
+    Serial.print(pdbModFreq);
+    Serial.println(" Hz");
+  }
   Serial.println("==================================");
 
   server.on("/", handleRoot);
